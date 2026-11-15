@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ESP32-C3 | IMU + Mic BLE Logger</title>
+<title>XIAO nRF52840 Sense | IMU + Mic BLE Logger</title>
 <style>
 :root { color-scheme:dark; --bg:#0b1220; --panel:#151e30; --line:#30405b; --text:#e5edf9; --muted:#9daec4; --blue:#70b8ff; --teal:#43dab0; --red:#ff7189; --yellow:#ffcb75; }
 * { box-sizing:border-box; } body {margin:0;background:var(--bg);color:var(--text);font-family:system-ui,Arial,sans-serif;line-height:1.4}
@@ -26,8 +26,8 @@ footer {font-size:13px;color:var(--muted);margin-top:18px}
 </style>
 </head>
 <body><main>
-<h1>ESP32-C3 Sensor Recorder</h1>
-<p>MPU6050 · 200 Hz &nbsp; | &nbsp; MAX4466 · 8,000 Hz (24 kHz ADC/DMA → FIR decimation) · 50 ms BLE batches &nbsp; | &nbsp; Web Bluetooth</p>
+<h1>XIAO nRF52840 Sense Recorder</h1>
+<p>Onboard LSM6DS3TR-C · nominal 200 Hz &nbsp; | &nbsp; MAX4466 A0 · 8,000 Hz (SAADC EasyDMA / hardware timer) · 50 ms BLE batches &nbsp; | &nbsp; Web Bluetooth</p>
 <div id="status" role="status">Disconnected. Pair to begin.</div>
 <div class="controls">
   <button class="primary" id="pair">1. Pair / Connect</button>
@@ -40,7 +40,7 @@ footer {font-size:13px;color:var(--muted);margin-top:18px}
   <button id="heartWav" disabled>Download Heart WAV</button>
   <button id="refresh">5. Refresh Data</button>
 </div>
-<div class="panel" style="margin:12px 0"><strong>Offline audio processing</strong><p style="margin:5px 0 8px">Raw WAV contains unmodified 8 kHz output samples (24 kHz ADC followed by a 3.25 kHz anti-alias FIR); no speech/heart denoising is applied. Speech uses harmonic hum suppression, persistent-tone reduction, Wiener-style spectral filtering and a smoothed voice gate. Heart mode is 25–400 Hz band-pass only; neither processed export is for medical diagnosis.</p>
+<div class="panel" style="margin:12px 0"><strong>Offline audio processing</strong><p style="margin:5px 0 8px">Raw WAV contains unmodified 8 kHz output samples (hardware-timed 8 kHz SAADC); no speech/heart denoising is applied. Speech uses harmonic hum suppression, persistent-tone reduction, Wiener-style spectral filtering and a smoothed voice gate. Heart mode is 25–400 Hz band-pass only; neither processed export is for medical diagnosis.</p>
 <label><input type="checkbox" id="speechGate" checked> Apply voice-activity gate to speech (uncheck for a more natural sound)</label>
 <div id="processing" aria-live="polite" style="color:var(--muted);font-size:13px;margin-top:8px">Processing runs locally in your browser after recording stops.</div></div>
 <div class="metrics">
@@ -50,9 +50,9 @@ footer {font-size:13px;color:var(--muted);margin-top:18px}
   <div class="metric"><span>Sequence gaps*</span><strong id="missing">0</strong></div>
 </div>
 <section class="panel"><h2>Accelerometer (g)</h2><div class="legend">X: blue &nbsp; Y: green &nbsp; Z: pink · rolling 6-second window</div><canvas id="imuPlot"></canvas></section>
-<section class="panel"><h2>Microphone (raw ADC counts)</h2><div class="legend">0–4095, 12-bit after anti-alias FIR · rolling 6-second window (plot decimated; CSV full rate)</div><canvas id="micPlot"></canvas></section>
+<section class="panel"><h2>Microphone (raw ADC counts)</h2><div class="legend">0–4095, raw 12-bit SAADC · rolling 6-second window (plot decimated; CSV full rate)</div><canvas id="micPlot"></canvas></section>
 <section class="panel"><h2>Event log</h2><div id="log" aria-live="polite">Waiting for connection…</div></section>
-<footer>* Sequence gaps include sampling deadlines missed on the ESP32 and BLE packets missing at the browser. Device ring-buffer overflows are reported separately in the event log. WAV is 16-bit PCM mono at the nominal 8,000 Hz rate, with missing sequence samples filled with silence; refresh only clears plots, not stored samples. Browser time sync is approximate because BLE write latency is variable. No persistent storage or retransmission on the ESP32. Firmware sends buffered notifications approximately every 50 ms, which may or may not reduce noise. MTU >=100 is required.</footer>
+<footer>* Sequence gaps include sampling deadlines missed on the nRF52840 and BLE packets missing at the browser. Device ring-buffer overflows are reported separately in the event log. WAV is 16-bit PCM mono at the nominal 8,000 Hz rate, with missing sequence samples filled with silence; refresh only clears plots, not stored samples. Browser time sync is approximate because BLE write latency is variable. No persistent storage or retransmission on the nRF52840. Firmware sends buffered notifications approximately every 50 ms, which may or may not reduce noise. MTU >=100 is required.</footer>
 </main>
 <script id="dsp-worker" type="text/plain">
 // Runs in a Web Worker. Offline JS adaptation of user-provided denoise4.py.
@@ -456,7 +456,7 @@ function makeCsv(kind){
   const blob=new Blob(parts,{type:'text/csv;charset=utf-8'});
   const url=URL.createObjectURL(blob),a=document.createElement('a');
   const name=kind==='imu'?'imu':'mic';
-  a.href=url;a.download=`ESP32C3_${name}_${new Date().toISOString().replaceAll(':','-')}.csv`;
+  a.href=url;a.download=`XIAO_nRF52840_${name}_${new Date().toISOString().replaceAll(':','-')}.csv`;
   document.body.append(a);a.click();a.remove();
   setTimeout(()=>URL.revokeObjectURL(url),10000);
   log(`Exported ${rows.length.toLocaleString()} ${name.toUpperCase()} rows.`);
@@ -487,7 +487,7 @@ function saveWave(samples,suffix,missing=0){
   for(let i=0;i<n;i++)d.setInt16(44+2*i,Math.round(Math.max(-1,Math.min(1,samples[i]))*32767),true);
   const url=URL.createObjectURL(new Blob([buffer],{type:'audio/wav'}));
   const a=document.createElement('a');a.href=url;
-  a.download=`ESP32C3_${suffix}_${new Date().toISOString().replaceAll(':','-')}.wav`;
+  a.download=`XIAO_nRF52840_${suffix}_${new Date().toISOString().replaceAll(':','-')}.wav`;
   document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),30000);
   log(`Saved ${suffix} WAV: ${n} samples, ${missing} unavailable samples represented as silence.`);
 }
