@@ -1,0 +1,339 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>nRF52840 Sense BLE Recorder</title>
+  <style>
+    :root { color-scheme: light dark; --bg:#0b1020; --fg:#e8ecf1; --card:#151b2e; --accent:#4da3ff; --muted:#94a3b8; --ok:#22c55e; --warn:#f59e0b; }
+    @media (prefers-color-scheme: light){ :root{ --bg:#f6f8fb; --fg:#0f172a; --card:#ffffff; --accent:#2563eb; --muted:#64748b; } }
+    body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background:var(--bg); color:var(--fg); }
+    .wrap { max-width: 980px; margin: 0 auto; padding: 20px; }
+    h1 { font-size: 1.4rem; margin: 0 0 4px; }
+    p.sub { color:var(--muted); margin:0 0 16px; }
+    .grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(220px,1fr)); gap:12px; }
+    .card { background:var(--card); border:1px solid rgba(127,127,127,.15); border-radius:12px; padding:14px; }
+    .card h2 { font-size:.95rem; margin:0 0 10px; color:var(--muted); font-weight:600; text-transform:uppercase; letter-spacing:.04em; }
+    button { appearance:none; border:1px solid rgba(127,127,127,.25); background:transparent; color:var(--fg); padding:10px 12px; border-radius:8px; cursor:pointer; font:inherit; width:100%; margin:4px 0; }
+    button.primary { background:var(--accent); color:white; border-color:transparent; }
+    button:disabled { opacity:.45; cursor:not-allowed; }
+    .row { display:flex; gap:8px; } .row button{ flex:1; }
+    #status { font-weight:600; }
+    .pill { display:inline-block; padding:2px 8px; border-radius:999px; font-size:.8rem; background:rgba(127,127,127,.15); }
+    .ok { color:var(--ok); } .warn{ color:var(--warn); }
+    pre { background:rgba(0,0,0,.2); padding:10px; border-radius:8px; overflow:auto; max-height:220px; font-size:.85rem; }
+    .stats { display:grid; grid-template-columns:1fr 1fr; gap:6px 12px; font-size:.9rem; }
+    .stats span { color:var(--muted); }
+    small.note { color:var(--muted); display:block; margin-top:8px; line-height:1.4; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Seeed nRF52840 Sense &mdash; BLE Recorder</h1>
+    <p class="sub">Pairs via Web Bluetooth, syncs system time, streams timestamped IMU (416&nbsp;Hz) and microphone audio (8&nbsp;kHz, ADPCM) as binary packets.</p>
+
+    <div class="grid">
+      <div class="card">
+        <h2>1. Connection</h2>
+        <button id="btnPair" class="primary">Pair / Connect</button>
+        <button id="btnDisconnect" disabled>Disconnect</button>
+        <p style="margin:8px 0 0">Status: <span id="status" class="pill">Disconnected</span></p>
+        <small class="note">Requires Chrome/Edge on Android or desktop (Web Bluetooth). Page must be served over HTTPS or localhost.</small>
+      </div>
+
+      <div class="card">
+        <h2>2–3. Recording</h2>
+        <div class="row">
+          <button id="btnStart" disabled>Start Recording</button>
+          <button id="btnStop" disabled>Stop Recording</button>
+        </div>
+        <button id="btnReset">7. Reset Data</button>
+        <small class="note">On connect, host system time is sent to the device for timestamp alignment.</small>
+      </div>
+
+      <div class="card">
+        <h2>4–6. Downloads</h2>
+        <button id="btnDlImu" disabled>4. Download IMU (CSV)</button>
+        <button id="btnDlAudioCsv" disabled>5. Download Audio (CSV)</button>
+        <button id="btnDlWav" disabled>6. Download Audio (.wav)</button>
+      </div>
+
+      <div class="card">
+        <h2>Session Stats</h2>
+        <div class="stats">
+          <span>IMU samples</span><div id="stImu">0</div>
+          <span>IMU packets</span><div id="stImuPkt">0</div>
+          <span>Audio samples</span><div id="stAud">0</div>
+          <span>Audio packets</span><div id="stAudPkt">0</div>
+          <span>Last IMU t (ms)</span><div id="stImuT">-</div>
+          <span>Last Audio t (ms)</span><div id="stAudT">-</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:12px">
+      <h2>Log</h2>
+      <pre id="log"></pre>
+    </div>
+  </div>
+
+<script>
+(() => {
+  // UUIDs must match the sketch
+  const SERVICE_UUID = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+  const CMD_UUID     = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';
+  const IMU_UUID     = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
+  const AUDIO_UUID   = '6e400004-b5a3-f393-e0a9-e50e24dcca9e';
+  const STATUS_UUID  = '6e400005-b5a3-f393-e0a9-e50e24dcca9e';
+
+  const CMD = { SET_TIME: 0x01, START: 0x02, STOP: 0x03, RESET: 0x04 };
+  const PKT = { IMU: 0x01, AUDIO: 0x02 };
+
+  let device, server, service, cmdChar, imuChar, audioChar, statusChar;
+  let baseEpochMs = null; // device sync reference
+
+  // Recorded data
+  let imuRecords = [];   // {seq,t_ms,abs_ms,ax,ay,az,gx,gy,gz}
+  let audioPackets = []; // {seq,t_ms,abs_ms,sampleRate,samples:Int16Array}
+  let imuPktCount = 0, audioPktCount = 0, audioSampleCount = 0;
+
+  const $ = id => document.getElementById(id);
+  const logEl = $('log');
+  function log(msg) {
+    const t = new Date().toLocaleTimeString();
+    logEl.textContent = `[${t}] ${msg}\n` + logEl.textContent.slice(0, 8000);
+  }
+  function setStatus(text, cls='') {
+    const el = $('status'); el.textContent = text; el.className = 'pill ' + cls;
+  }
+  function updateStats(lastImuT='-', lastAudT='-') {
+    $('stImu').textContent = imuRecords.length;
+    $('stImuPkt').textContent = imuPktCount;
+    $('stAud').textContent = audioSampleCount;
+    $('stAudPkt').textContent = audioPktCount;
+    if (lastImuT !== undefined) $('stImuT').textContent = lastImuT;
+    if (lastAudT !== undefined) $('stAudT').textContent = lastAudT;
+  }
+  function setUi(connected, recording=false) {
+    $('btnPair').disabled = connected;
+    $('btnDisconnect').disabled = !connected;
+    $('btnStart').disabled = !connected || recording;
+    $('btnStop').disabled = !connected || !recording;
+    const hasData = imuRecords.length || audioSampleCount;
+    $('btnDlImu').disabled = imuRecords.length === 0;
+    $('btnDlAudioCsv').disabled = audioSampleCount === 0;
+    $('btnDlWav').disabled = audioSampleCount === 0;
+  }
+
+  // ---------- IMA ADPCM decode (per-packet, decoder reset each packet to match encoder) ----------
+  const imaStepTable = [
+    7,8,9,10,11,12,13,14,16,17,19,21,23,25,28,31,34,37,41,45,50,55,60,66,73,80,88,97,107,118,130,
+    143,157,173,190,209,230,253,279,307,337,371,408,449,494,544,598,658,724,796,876,963,1060,1166,
+    1282,1411,1552,1707,1878,2066,2272,2499,2749,3024,3327,3660,4026,4428,4871,5358,5894,6484,
+    7132,7845,8630,9493,10442,11487,12635,13899,15289,16818,18500,20350,22385,24623,27086,29794,32767
+  ];
+  const imaIndexTable = [-1,-1,-1,-1,2,4,6,8];
+  function decodeImaAdpcm(bytes, sampleCount, initPredictor=0, initStep=0) {
+    let predictor = initPredictor, stepIndex = initStep;
+    const out = new Int16Array(sampleCount);
+    let nibbleIndex = 0;
+    for (let i = 0; i < sampleCount; i++) {
+      const byte = bytes[nibbleIndex >> 1];
+      const code = (nibbleIndex & 1) ? (byte >> 4) & 0xF : byte & 0xF;
+      nibbleIndex++;
+      let step = imaStepTable[stepIndex];
+      let diff = (step >> 3);
+      if (code & 4) diff += step;
+      if (code & 2) diff += (step >> 1);
+      if (code & 1) diff += (step >> 2);
+      if (code & 8) predictor -= diff; else predictor += diff;
+      if (predictor > 32767) predictor = 32767;
+      if (predictor < -32768) predictor = -32768;
+      stepIndex += imaIndexTable[code & 7];
+      if (stepIndex < 0) stepIndex = 0; if (stepIndex > 88) stepIndex = 88;
+      out[i] = predictor;
+    }
+    return out;
+  }
+
+  // ---------- Packet parsing ----------
+  function onImuNotify(ev) {
+    const dv = new DataView(ev.target.value.buffer);
+    if (dv.byteLength < 8) return;
+    const type = dv.getUint8(0);
+    if (type !== PKT.IMU) return;
+    const seq = dv.getUint32(1, true);
+    const count = dv.getUint8(5);
+    const hdr = 8, sampleSize = 16;
+    imuPktCount++;
+    let lastT = '-';
+    for (let i = 0; i < count; i++) {
+      const off = hdr + i * sampleSize;
+      if (off + sampleSize > dv.byteLength) break;
+      const t_ms = dv.getUint32(off + 0, true);
+      const ax = dv.getInt16(off + 4, true);
+      const ay = dv.getInt16(off + 6, true);
+      const az = dv.getInt16(off + 8, true);
+      const gx = dv.getInt16(off + 10, true);
+      const gy = dv.getInt16(off + 12, true);
+      const gz = dv.getInt16(off + 14, true);
+      const abs_ms = (baseEpochMs != null) ? (baseEpochMs + t_ms) : t_ms;
+      imuRecords.push({ seq, t_ms, abs_ms, ax, ay, az, gx, gy, gz });
+      lastT = t_ms;
+    }
+    updateStats(lastT, undefined);
+  }
+
+  function onAudioNotify(ev) {
+    const dv = new DataView(ev.target.value.buffer);
+    if (dv.byteLength < 17) return;
+    const type = dv.getUint8(0);
+    if (type !== PKT.AUDIO) return;
+    const seq = dv.getUint32(1, true);
+    const t_ms = dv.getUint32(5, true);
+    const sampleRate = dv.getUint16(9, true) || 8000;
+    const sampleCount = dv.getUint16(11, true);
+    const pred = dv.getInt16(13, true);
+    const step = dv.getUint8(15);
+    const data = new Uint8Array(ev.target.value.buffer, 17);
+    const samples = decodeImaAdpcm(data, sampleCount, pred, step);
+    const abs_ms = (baseEpochMs != null) ? (baseEpochMs + t_ms) : t_ms;
+    audioPackets.push({ seq, t_ms, abs_ms, sampleRate, samples });
+    audioPktCount++;
+    audioSampleCount += samples.length;
+    updateStats(undefined, t_ms);
+  }
+
+  function onStatusNotify(ev) {
+    const txt = new TextDecoder().decode(ev.target.value);
+    log('Device: ' + txt);
+  }
+
+  async function sendTimeSync() {
+    // epoch ms as uint64 little-endian
+    const now = BigInt(Date.now());
+    const buf = new ArrayBuffer(9);
+    const view = new DataView(buf);
+    view.setUint8(0, CMD.SET_TIME);
+    // write uint64 LE
+    let v = now;
+    for (let i = 0; i < 8; i++) { view.setUint8(1 + i, Number(v & 0xFFn)); v >>= 8n; }
+    baseEpochMs = Number(now);
+    await cmdChar.writeValue(buf);
+    log('Sent system time: ' + new Date().toISOString());
+  }
+
+  async function connect() {
+    if (!navigator.bluetooth) { alert('Web Bluetooth not supported in this browser.'); return; }
+    try {
+      setStatus('Requesting...', 'warn');
+      device = await navigator.bluetooth.requestDevice({
+        filters: [{ namePrefix: 'NRF_HEART' }, { namePrefix: 'XIAO' }],
+        optionalServices: [SERVICE_UUID]
+      });
+      device.addEventListener('gattserverdisconnected', onDisconnected);
+      server = await device.gatt.connect();
+      service = await server.getPrimaryService(SERVICE_UUID);
+      cmdChar = await service.getCharacteristic(CMD_UUID);
+      imuChar = await service.getCharacteristic(IMU_UUID);
+      audioChar = await service.getCharacteristic(AUDIO_UUID);
+      statusChar = await service.getCharacteristic(STATUS_UUID);
+
+      await imuChar.startNotifications(); imuChar.addEventListener('characteristicvaluechanged', onImuNotify);
+      await audioChar.startNotifications(); audioChar.addEventListener('characteristicvaluechanged', onAudioNotify);
+      try { await statusChar.startNotifications(); statusChar.addEventListener('characteristicvaluechanged', onStatusNotify); } catch(e){}
+
+      await sendTimeSync();
+      setStatus('Connected', 'ok');
+      setUi(true, false);
+      log('Connected to ' + (device.name || device.id));
+    } catch (e) {
+      log('Connect error: ' + e);
+      setStatus('Disconnected');
+      setUi(false);
+    }
+  }
+
+  function onDisconnected() {
+    setStatus('Disconnected');
+    setUi(false);
+    log('Disconnected');
+  }
+
+  async function disconnect() { try { if (device && device.gatt.connected) device.gatt.disconnect(); } catch(e){} }
+  async function sendCmd(c) { if (cmdChar) await cmdChar.writeValue(Uint8Array.of(c)); }
+
+  $('btnPair').onclick = connect;
+  $('btnDisconnect').onclick = disconnect;
+  $('btnStart').onclick = async () => { await sendCmd(CMD.START); setUi(true, true); log('Recording started'); };
+  $('btnStop').onclick = async () => { await sendCmd(CMD.STOP); setUi(true, false); log('Recording stopped'); };
+  $('btnReset').onclick = async () => {
+    imuRecords = []; audioPackets = []; imuPktCount = 0; audioPktCount = 0; audioSampleCount = 0; baseEpochMs = null;
+    updateStats('-', '-');
+    try { await sendCmd(CMD.RESET); } catch(e){}
+    log('Data reset');
+    setUi(!!(device && device.gatt.connected), false);
+  };
+
+  function downloadBlob(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a'); a.href = url; a.download = filename; a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+  }
+
+  $('btnDlImu').onclick = () => {
+    let csv = 'seq,device_t_ms,abs_epoch_ms,ax_mg,ay_mg,az_mg,gx_mdps10,gy_mdps10,gz_mdps10\n';
+    for (const r of imuRecords) {
+      const absIso = (r.abs_ms > 1e12) ? new Date(r.abs_ms).toISOString() : r.abs_ms;
+      csv += `${r.seq},${r.t_ms},${typeof r.abs_ms==='number'?r.abs_ms:''},"${absIso}",`.replace(',"','').replace('"',''); // simplify
+    }
+    // build properly
+    csv = 'seq,device_t_ms,abs_epoch_ms,abs_iso,ax_mg,ay_mg,az_mg,gx_cdeg_s,gy_cdeg_s,gz_cdeg_s\n';
+    for (const r of imuRecords) {
+      const absIso = (r.abs_ms > 1e11) ? new Date(r.abs_ms).toISOString() : '';
+      csv += [r.seq,r.t_ms,r.abs_ms,absIso,r.ax,r.ay,r.az,r.gx,r.gy,r.gz].join(',') + '\n';
+    }
+    downloadBlob(new Blob([csv], {type:'text/csv'}), 'imu_data.csv');
+  };
+
+  function getAllAudioSamples() {
+    const total = audioPackets.reduce((n,p)=>n+p.samples.length,0);
+    const out = new Int16Array(total);
+    let off = 0;
+    for (const p of audioPackets) { out.set(p.samples, off); off += p.samples.length; }
+    return { samples: out, sampleRate: (audioPackets[0] && audioPackets[0].sampleRate) || 8000 };
+  }
+
+  $('btnDlAudioCsv').onclick = () => {
+    const { samples, sampleRate } = getAllAudioSamples();
+    let csv = 'sample_index,t_ms,abs_epoch_ms,pcm_int16\n';
+    const startAbs = audioPackets.length ? audioPackets[0].abs_ms : 0;
+    for (let i = 0; i < samples.length; i++) {
+      const t = (i / sampleRate) * 1000;
+      const abs = startAbs + t;
+      csv += `${i},${t.toFixed(3)},${Math.round(abs)},${samples[i]}\n`;
+    }
+    downloadBlob(new Blob([csv], {type:'text/csv'}), 'audio_data.csv');
+  };
+
+  $('btnDlWav').onclick = () => {
+    const { samples, sampleRate } = getAllAudioSamples();
+    const buffer = new ArrayBuffer(44 + samples.length * 2);
+    const view = new DataView(buffer);
+    const writeStr = (o,s)=>{ for(let i=0;i<s.length;i++) view.setUint8(o+i,s.charCodeAt(i)); };
+    const dataSize = samples.length * 2;
+    writeStr(0,'RIFF'); view.setUint32(4, 36 + dataSize, true); writeStr(8,'WAVE');
+    writeStr(12,'fmt '); view.setUint32(16,16,true); view.setUint16(20,1,true); view.setUint16(22,1,true);
+    view.setUint32(24,sampleRate,true); view.setUint32(28,sampleRate*2,true); view.setUint16(32,2,true); view.setUint16(34,16,true);
+    writeStr(36,'data'); view.setUint32(40,dataSize,true);
+    let off = 44;
+    for (let i=0;i<samples.length;i++,off+=2) view.setInt16(off, samples[i], true);
+    downloadBlob(new Blob([buffer], {type:'audio/wav'}), 'audio_data.wav');
+  };
+
+  updateStats('-', '-'); setUi(false);
+  log('Ready. Click Pair/Connect to begin.');
+})();
+</script>
+</body>
+</html>
